@@ -25,7 +25,7 @@ node_rank=0
 # The aishell dataset location, please change this to your own path
 # make sure of using absolute path. DO-NOT-USE relatvie path!
 #data=/export/data/asr-data/OpenSLR/33/  #训练数据存放路径
-data=/home/zhanghongbin/asr-data/OpenSLR/33/  #训练数据存放路径
+data=/home/zhanghongbin/asr-data/aishell/  #训练数据存放路径
 data_url=www.openslr.org/resources/33
 
 nj=16     #特征维度？
