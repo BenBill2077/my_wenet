@@ -24,17 +24,17 @@ num_nodes=1
 node_rank=0
 # The aishell dataset location, please change this to your own path
 # make sure of using absolute path. DO-NOT-USE relatvie path!
-data=/export/data/asr-data/OpenSLR/33/
+data=/export/data/asr-data/OpenSLR/33/  #训练数据存放路径
 data_url=www.openslr.org/resources/33
 
-nj=16
-dict=data/dict/lang_char.txt
+nj=16     #特征维度？
+dict=data/dict/lang_char.txt    #生成的字典存放目录
 
 # data_type can be `raw` or `shard`. Typically, raw is used for small dataset,
 # `shard` is used for large dataset which is over 1k hours, and `shard` is
 # faster on reading data and training.
 data_type=raw
-num_utts_per_shard=1000
+num_utts_per_shard=1000         #每个shard文件存放音频个数，默认1000
 
 train_set=train
 # Optional train_config
@@ -44,16 +44,16 @@ train_set=train
 # 4. conf/train_unified_transformer.yaml: Unified dynamic chunk transformer
 # 5. conf/train_u2++_conformer.yaml: U2++ conformer
 # 6. conf/train_u2++_transformer.yaml: U2++ transformer
-train_config=conf/train_conformer.yaml
-cmvn=true
-dir=exp/conformer
-checkpoint=
+train_config=conf/train_conformer.yaml    #训练配置，使用conformer
+cmvn=true                     #Cepstral Mean and Variance Normalization： 倒谱均值 方差归一化
+dir=exp/conformer             #实验结果目录，产生的模型文件和训练结果放在什么位置，比如可以改为exp/conformer-20220707-1
+checkpoint=                   #训练中断后，可以指定checkpoint接着训练模型
 
 # use average_checkpoint will get better result
-average_checkpoint=true
-decode_checkpoint=$dir/final.pt
-average_num=30
-decode_modes="ctc_greedy_search ctc_prefix_beam_search attention attention_rescoring"
+average_checkpoint=true       #对多个模型取平均，一般比 只取最后一个模型 效果更好
+decode_checkpoint=$dir/final.pt     #这里dir是exp/conformer，也可以指定$checkpoint中的文件接着训练
+average_num=30                #用最后多少个模型取平均
+decode_modes="ctc_greedy_search ctc_prefix_beam_search attention attention_rescoring"     #四种解码方式
 
 . tools/parse_options.sh || exit 1;
 
@@ -115,6 +115,7 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   mkdir -p $dir
   # You have to rm `INIT_FILE` manually when you resume or restart a
   # multi-machine training.
+  #多卡训练需要的文件：
   INIT_FILE=$dir/ddp_init
   init_method=file://$(readlink -f $INIT_FILE)
   echo "$0: init method is $init_method"
@@ -130,6 +131,7 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   # train.py rewrite $train_config to $dir/train.yaml with model input
   # and output dimension, and $dir/train.yaml will be used for inference
   # and export.
+  #有多少张卡就起多少个进程：
   for ((i = 0; i < $num_gpus; ++i)); do
   {
     gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
