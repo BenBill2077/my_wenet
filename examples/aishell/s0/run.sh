@@ -5,7 +5,7 @@
 # Use this to control how many gpu you use, It's 1-gpu training if you specify
 # just 1gpu, otherwise it's is multiple gpu training based on DDP in pytorch
 #export CUDA_VISIBLE_DEVICES="0,1"
-export CUDA_VISIBLE_DEVICES="1"
+export CUDA_VISIBLE_DEVICES="1,2,3,4,5,6,7"
 # The NCCL_SOCKET_IFNAME variable specifies which IP interface to use for nccl
 # communication. More details can be found in
 # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html
@@ -25,7 +25,7 @@ num_nodes=1
 node_rank=0
 # The aishell dataset location, please change this to your own path
 # make sure of using absolute path. DO-NOT-USE relatvie path!
-data=/mnt/sda3/home/zhanghongbin/data/tibetan #训练数据存放路径
+data=/data1/zhang/tibetan #训练数据存放路径
 data_url=www.openslr.org/resources/22 #这是维语数据下载地址（data_thuyg20.tar.gz是语音识别数据）
 
 nj=16 #特征维度
@@ -36,8 +36,7 @@ dict=data/dict/lang_char.txt    #生成的字典存放目录
 # faster on reading data and training.
 data_type=raw
 # data_type=shard
-# num_utts_per_shard=1000
-num_utts_per_shard=100 #每个shard文件存放音频个数，默认1000
+# num_utts_per_shard=1000 #每个shard文件存放音频个数，默认1000
 
 train_set=train   #用训练集运行
 # Optional train_config
@@ -50,8 +49,10 @@ train_set=train   #用训练集运行
 train_config=conf/train_conformer.yaml  #训练配置
 cmvn=true #Cepstral Mean and Variance Normalization; 倒谱均值 方差归一化
 # dir=exp/conformer-kham-8head #实验结果目录，产生的模型文件和训练结果放在什么位置，比如可以改为exp/conformer-20220707-1
-dir=exp/conformer-amdo-12head
+dir=exp/conformer-amdo-16head
 checkpoint=       #训练中断后，可以指定checkpoint接着训练模型
+num_workers=1
+prefetch=500
 
 # use average_checkpoint will get better result
 average_checkpoint=true   #对多个模型取平均，一般比 只取最后一个模型 效果更好
@@ -59,18 +60,22 @@ decode_checkpoint=$dir/final.pt
 average_num=5            #用最后多少个模型取平均
 decode_modes="ctc_greedy_search ctc_prefix_beam_search attention attention_rescoring" #四种解码方式
 
+deepspeed=false # 不使用 DeepSpeed 框架进行模型训练
+deepspeed_config=conf/ds_stage2.json
+deepspeed_save_states="model_only"  # 表示只保存模型状态（推理时需要），而不是保存优化器和 AMP 状态。当使用 ModelParallel 或 Pipeline 并行时，每个 GPU 都有可能拥有其自己的优化器和 AMP 状态，因此将 deepspeed_save_states 设为 "all" 可以保存所有状态
+
 . tools/parse_options.sh || exit 1;
 
 if [ ${stage} -le -1 ] && [ ${stop_stage} -ge -1 ]; then
   echo "stage -1: Data Download"
-  local/download_and_untar.sh ${data} ${data_url} data_aishell 
+  local/download_and_untar.sh ${data} ${data_url} data_aishell
   local/download_and_untar.sh ${data} ${data_url} resource_aishell
 fi
 
 if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
-  # Data preparation
-  local/aishell_data_prep.sh ${data}/data_Kham/wav \
-    ${data}/data_Kham/transcript
+  # Data preparation ： 生成data/train、dev、test
+  local/aishell_data_prep.sh ${data}/data_amdo/wav \
+    ${data}/data_amdo/transcript
 fi
 
 
@@ -84,6 +89,7 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
     rm data/${x}/text.org
   done
 
+# 重采样：
   tools/compute_cmvn_stats.py --num_workers 16 --train_config $train_config \
     --in_scp data/${train_set}/wav.scp \
     --out_cmvn data/$train_set/global_cmvn
@@ -102,7 +108,7 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
 fi
 
 if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
-  echo "Prepare data, prepare requried format"
+  echo "Prepare data, prepare required format"
   for x in dev test ${train_set}; do
     if [ $data_type == "shard" ]; then
       tools/make_shard_list.py --num_utts_per_shard $num_utts_per_shard \
@@ -120,11 +126,12 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   # You have to rm `INIT_FILE` manually when you resume or restart a
   # multi-machine training.
   INIT_FILE=$dir/ddp_init
+  rm -f ${INIT_FILE}  # remove previous INIT_FILE
   init_method=file://$(readlink -f $INIT_FILE)
   echo "$0: init method is $init_method"
   num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
   # Use "nccl" if it works, otherwise use "gloo"
-  dist_backend="gloo"
+  dist_backend="nccl"
   world_size=`expr $num_gpus \* $num_nodes`
   echo "total gpus is: $world_size"
   cmvn_opts=
@@ -134,30 +141,60 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   # train.py rewrite $train_config to $dir/train.yaml with model input
   # and output dimension, and $dir/train.yaml will be used for inference
   # and export.
-  for ((i = 0; i < $num_gpus; ++i)); do
-  {
-    gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
-    # Rank of each gpu/process used for knowing whether it is
-    # the master of a worker.
-    rank=`expr $node_rank \* $num_gpus + $i`
-    python wenet/bin/train.py --gpu $gpu_id \
-      --config $train_config \
-      --data_type $data_type \
-      --symbol_table $dict \
-      --train_data data/$train_set/data.list \
-      --cv_data data/dev/data.list \
-      ${checkpoint:+--checkpoint $checkpoint} \
-      --model_dir $dir \
-      --ddp.init_method $init_method \
-      --ddp.world_size $world_size \
-      --ddp.rank $rank \
-      --ddp.dist_backend $dist_backend \
-      --num_workers 1 \
-      $cmvn_opts \
-      --pin_memory
-  } &
-  done
-  wait
+  if [ ${deepspeed} == true ]; then
+    echo "using deepspeed"
+    # NOTE(xcsong): deepspeed fails with gloo, see
+    #   https://github.com/microsoft/DeepSpeed/issues/2818
+    dist_backend="nccl"
+    [ ! -f data/$train_set/data.list.filter ] && \
+      python tools/filter_uneven_data.py data/$train_set/data.list \
+        $data_type $num_gpus $num_utts_per_shard data/$train_set/data.list.filter
+    deepspeed --include localhost:$CUDA_VISIBLE_DEVICES \
+      wenet/bin/train.py \
+        --deepspeed \
+        --deepspeed_config ${deepspeed_config} \
+        --deepspeed.save_states ${deepspeed_save_states} \
+        --ddp.dist_backend $dist_backend \
+        --ddp.init_method $init_method \
+        --data_type  $data_type \
+        --config $train_config \
+        --symbol_table  data/dict/lang_char.txt \
+        --train_data data/$train_set/data.list.filter \
+        --cv_data data/dev/data.list \
+        ${checkpoint:+--checkpoint $checkpoint} \
+        --model_dir $dir \
+        --num_workers ${num_workers} \
+        --prefetch ${prefetch} \
+        $cmvn_opts \
+        --pin_memory
+  else
+    echo "using torch ddp"
+    for ((i = 0; i < $num_gpus; ++i)); do
+    {
+      gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
+      # Rank of each gpu/process used for knowing whether it is
+      # the master of a worker.
+      rank=`expr $node_rank \* $num_gpus + $i`
+      python wenet/bin/train.py --gpu $gpu_id \
+        --config $train_config \
+        --data_type $data_type \
+        --symbol_table $dict \
+        --train_data data/$train_set/data.list \
+        --cv_data data/dev/data.list \
+        ${checkpoint:+--checkpoint $checkpoint} \
+        --model_dir $dir \
+        --ddp.init_method $init_method \
+        --ddp.world_size $world_size \
+        --ddp.rank $rank \
+        --ddp.dist_backend $dist_backend \
+        --num_workers ${num_workers} \
+        --prefetch ${prefetch} \
+        $cmvn_opts \
+        --pin_memory
+    } &
+    done
+    wait
+  fi
 fi
 
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
@@ -175,8 +212,8 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
   # non-streaming model. The default value is -1, which is full chunk
   # for non-streaming inference.
   decoding_chunk_size=
-  ctc_weight=0.5
-  reverse_weight=0.0
+  ctc_weight=0.3
+  reverse_weight=0.5
   for mode in ${decode_modes}; do
   {
     test_dir=$dir/test_${mode}
@@ -224,7 +261,7 @@ if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
   lm=data/local/lm
   mkdir -p $lm
   tools/filter_scp.pl data/train/text \
-    $data/data_Kham/transcript/aishell_transcript_v0.8.txt > $lm/text
+    $data/data_amdo/transcript/aishell_transcript_v0.8.txt > $lm/text
   local/aishell_train_lms.sh
   # 7.3 Build decoding TLG
   tools/fst/compile_lexicon_token_fst.sh \
@@ -237,10 +274,70 @@ if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
     --blank_skip_thresh 0.98 --ctc_weight 0.5 --rescoring_weight 1.0 \
     --chunk_size $chunk_size \
     --fst_path data/lang_test/TLG.fst \
-    --dict_path data/lang_test/words.fst \
+    --dict_path data/lang_test/words.txt \
     data/test/wav.scp data/test/text $dir/final.zip \
     data/lang_test/units.txt $dir/lm_with_runtime
   # Please see $dir/lm_with_runtime for wer
 fi
 
+# Optionally, you can decode with k2 hlg
+if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
+  if [ ! -f data/local/lm/lm.arpa ]; then
+    echo "Please run prepare dict and train lm in Stage 7" || exit 1;
+  fi
+
+  # 8.1 Build decoding HLG
+  required="data/local/hlg/HLG.pt data/local/hlg/words.txt"
+  for f in $required; do
+    if [ ! -f $f ]; then
+      tools/k2/make_hlg.sh data/local/dict/ data/local/lm/ data/local/hlg
+      break
+    fi
+  done
+
+  # 8.2 Decode using HLG
+  decoding_chunk_size=
+  lm_scale=0.7
+  decoder_scale=0.1
+  r_decoder_scale=0.7
+  for mode in hlg_onebest hlg_rescore; do
+  {
+    test_dir=$dir/test_${mode}
+    mkdir -p $test_dir
+    python wenet/bin/recognize.py --gpu 0 \
+      --mode $mode \
+      --config $dir/train.yaml \
+      --data_type $data_type \
+      --test_data data/test/data.list \
+      --checkpoint $decode_checkpoint \
+      --beam_size 10 \
+      --batch_size 16 \
+      --penalty 0.0 \
+      --dict $dict \
+      --word data/local/hlg/words.txt \
+      --hlg data/local/hlg/HLG.pt \
+      --lm_scale $lm_scale \
+      --decoder_scale $decoder_scale \
+      --r_decoder_scale $r_decoder_scale \
+      --result_file $test_dir/text \
+      ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
+    python tools/compute-wer.py --char=1 --v=1 \
+      data/test/text $test_dir/text > $test_dir/wer
+  }
+  done
+fi
+
+# Optionally, you can train with LF-MMI using k2
+# Based on 20210601_u2++_conformer_exp/final.pt, we train 50 epocs with 1e-5 lr
+# and average 10 best models, achieve 4.11 cer with hlg decoding
+# Actually, you can achieve even lower cer by tuning lm_scale/decoder_scale/r_decoder_scale
+if [ ${stage} -le 9 ] && [ ${stop_stage} -ge 9 ]; then
+  # 9.1 Build token level bigram fst for LF-MMI training
+  tools/k2/prepare_mmi.sh data/train/ data/dev data/local/lfmmi
+
+  # 9.2 Run LF-MMI training from stage 4, with below new args
+  # --lfmmi_dir data/local/lfmmi
+
+  # 9.3 Run HLG decode from stage 8.2
+fi
 
